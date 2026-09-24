@@ -83,7 +83,7 @@ function ArtifactBody({ artifact, seq, zoom, scrollRef }) {
   return jsx('div', {
     ref: scrollRef,
     className: 'min-h-0 flex-1 overflow-auto',
-    children,
+    children: content,
   })
 }
 

@@ -57,10 +57,12 @@ the session-side proof that the artifact actually rendered on the user's screen.
 
 ```bash
 python -m pytest test_plugin_api.py
+node --test test_desktop_plugin.cjs
 ```
 
 Six in-process tests cover the API contract: state read, ack round-trip, artifact
-byte serving, path-traversal rejection, and the session CLI round-trip.
+byte serving, path-traversal rejection, and the session CLI round-trip. The Node
+render test exercises the real desktop pane component with a staged image.
 
 ## Notes
 
