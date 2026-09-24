@@ -30,11 +30,16 @@ test('loads remote artifact bytes through the authenticated plugin REST API', as
     1,
     null,
     null,
+    'Check the selected heading',
     null,
+    false,
+    false,
+    { x: 0.1, y: 0.2, w: 0.3, h: 0.4, normalized: true },
   ]
   let hookIndex = 0
   let effects = []
   const apiCalls = []
+  const talkBodies = []
   const jsx = (type, props = {}) => ({ type, props })
   const hooks = {
     useState: (initial) => {
@@ -48,18 +53,24 @@ test('loads remote artifact bytes through the authenticated plugin REST API', as
     useRef: (current) => ({ current }),
   }
   const loadPlugin = new Function(
-    'cn', 'jsx', 'jsxs', 'Fragment', 'useEffect', 'useRef', 'useState',
+    'cn', 'jsx', 'jsxs', 'Fragment', 'useEffect', 'useRef', 'useState', 'host',
     `${source}\nreturn plugin;`,
   )
   const plugin = loadPlugin((...parts) => parts.filter(Boolean).join(' '), jsx, jsx, {},
-    hooks.useEffect, hooks.useRef, hooks.useState)
+    hooks.useEffect, hooks.useRef, hooks.useState, {
+      state: { focusedSessionProfile: { get: () => 'verifier' } },
+    })
   const contributions = []
   plugin.register({
     register: (contribution) => contributions.push(contribution),
-    rest: async (apiPath) => {
+    rest: async (apiPath, options) => {
       apiCalls.push(apiPath)
       if (apiPath === '/file-data-url/demo.png') {
         return { data_url: 'data:image/png;base64,aGVsbG8=' }
+      }
+      if (apiPath === '/talk') {
+        talkBodies.push(options?.body)
+        return { id: 'refer-1', delivered: true, delivery_status: 'queued' }
       }
       throw new Error(`unexpected plugin API path: ${apiPath}`)
     },
@@ -94,4 +105,13 @@ test('loads remote artifact bytes through the authenticated plugin REST API', as
     new URL(imageNode.props.src, 'file:///Applications/Hermes.app/index.html').protocol,
     'data:',
   )
+
+  const form = findType(renderPane(), 'form')
+  await form.props.onSubmit({ preventDefault() {} })
+  assert.deepEqual(apiCalls, ['/file-data-url/demo.png', '/talk'])
+  assert.equal(talkBodies.length, 1)
+  assert.equal(talkBodies[0].prompt, 'Check the selected heading')
+  assert.equal(talkBodies[0].profile, 'verifier')
+  assert.equal(talkBodies[0].artifact_title, 'Demo image')
+  assert.deepEqual(talkBodies[0].region, { x: 0.1, y: 0.2, w: 0.3, h: 0.4, normalized: true })
 })

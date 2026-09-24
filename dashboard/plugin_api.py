@@ -20,6 +20,10 @@ import math
 import mimetypes
 import os
 import re
+import shutil
+import subprocess
+import sys
+import threading
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -110,12 +114,22 @@ def _validate_talk(body: dict) -> dict:
         raise HTTPException(status_code=422, detail="prompt must contain 1..2000 characters")
     entry = {
         "id": uuid.uuid4().hex,
+        "request_id": str(body.get("request_id") or uuid.uuid4().hex),
         "ts_iso": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "prompt": prompt,
         "region": None,
         "artifact_id": None,
+        "profile": str(body.get("profile") or "default"),
+        "delivered": False,
+        "delivery_status": "pending",
+        "queued_at": None,
         "consumed": False,
     }
+    request_id = entry["request_id"]
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", request_id):
+        raise HTTPException(status_code=422, detail="invalid request_id")
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", entry["profile"]):
+        raise HTTPException(status_code=422, detail="invalid profile")
     if "artifact_id" in body and body["artifact_id"] is not None:
         artifact_id = body["artifact_id"]
         if not isinstance(artifact_id, str) or not _ARTIFACT_ID_RE.fullmatch(artifact_id) or ".." in artifact_id:
@@ -157,15 +171,27 @@ def get_ack() -> dict:
 
 @router.post("/ack")
 def post_ack(body: dict) -> dict:
-    ack = {
-        "seq": int(body.get("seq", 0)),
-        "rendered": bool(body.get("rendered", False)),
-        "error": body.get("error"),
-        "scroll_pct": body.get("scroll_pct"),
-        "at": body.get("at"),
-    }
+    now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    previous = _read_json(_runtime_dir() / "ack.json", {})
+    if body.get("heartbeat") is True:
+        ack = dict(previous)
+        ack.setdefault("seq", int(body.get("seq", 0)))
+        ack.setdefault("rendered", False)
+        ack.setdefault("error", None)
+        ack.setdefault("scroll_pct", None)
+        ack.setdefault("at", None)
+        ack["polled_at"] = now
+    else:
+        ack = {
+            "seq": int(body.get("seq", 0)),
+            "rendered": bool(body.get("rendered", False)),
+            "error": body.get("error"),
+            "scroll_pct": body.get("scroll_pct"),
+            "at": now,
+            "polled_at": now,
+        }
     _atomic_write_json(_runtime_dir() / "ack.json", ack)
-    return {"ok": True, "seq": ack["seq"]}
+    return {"ok": True, "seq": ack["seq"], "polled_at": ack["polled_at"]}
 
 
 @router.get("/talks")
@@ -175,15 +201,90 @@ def get_talks() -> dict:
     return {"pending": pending}
 
 
+def _spawn_reference_delivery(entry: dict):
+    """Hand one attributed stage reference to the canonical profile Bot Chat."""
+    runner = _home() / "hermes-agent" / "tools" / "bot_mode_dm.py"
+    cli = shutil.which("hermes")
+    if not runner.is_file() or not cli:
+        raise RuntimeError("Bot Chat relay runner or hermes CLI is unavailable")
+    runtime = _runtime_dir() / "deliveries"
+    runtime.mkdir(parents=True, exist_ok=True)
+    query = runtime / f"{entry['id']}.txt"
+    region = entry.get("region")
+    region_text = (f" region x={region['x']:.3f}, y={region['y']:.3f}, "
+                   f"w={region['w']:.3f}, h={region['h']:.3f}") if region else ""
+    title = entry.get("artifact_title") or entry.get("artifact_id") or "current artifact"
+    message = f"Stage reference — {title}{region_text}: {entry['prompt']}"
+    query.write_text(message, encoding="utf-8")
+    os.chmod(query, 0o600)
+    author = json.dumps({"id": "bot:artifact-stage", "name": "artifact-stage", "is_bot": True}, separators=(",", ":"))
+    profile = entry["profile"]
+    argv = [sys.executable, str(runner), "--run-delivery", "--author", author,
+            "query-file", str(query), cli, "-p", profile, "chat", "--in", "~",
+            "-c", "Bot Chat", "--create-if-missing", "-Q", "--query-file", str(query)]
+    env = dict(os.environ)
+    env["HERMES_HOME"] = str(_home())
+    try:
+        return subprocess.Popen(argv, cwd=str(runner.parent.parent), env=env,
+                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL, close_fds=True, start_new_session=True)
+    except Exception:
+        query.unlink(missing_ok=True)
+        raise
+
+
+def _record_delivery_completion(talk_id: str, process) -> None:
+    return_code = process.wait()
+    with _talks_lock():
+        entries = _read_talk_entries()
+        for entry in entries:
+            if entry.get("id") == talk_id:
+                entry["delivered"] = return_code == 0
+                entry["delivery_status"] = "delivered" if return_code == 0 else "failed"
+                entry["completed_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+                if return_code != 0:
+                    entry["delivery_error"] = f"Bot Chat runner exited {return_code}"
+                _write_talk_entries(entries)
+                return
+
+
+@router.get("/talks/{talk_id}")
+def get_talk(talk_id: str) -> dict:
+    with _talks_lock():
+        entry = next((item for item in _read_talk_entries() if item.get("id") == talk_id), None)
+    if entry is None:
+        raise HTTPException(status_code=404, detail="talk not found")
+    return entry
+
+
 @router.post("/talk")
 def post_talk(body: dict) -> dict:
     entry = _validate_talk(body)
     with _talks_lock():
+        entries = _read_talk_entries()
+        existing = next((item for item in entries if item.get("request_id") == entry["request_id"]), None)
+        if existing:
+            return existing
         path = _talks_path()
         with path.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(entry, ensure_ascii=False) + "\n")
             stream.flush()
             os.fsync(stream.fileno())
+        try:
+            process = _spawn_reference_delivery(entry)
+        except Exception as exc:
+            entry["delivery_status"] = "failed"
+            entry["delivery_error"] = str(exc)[:300]
+            _write_talk_entries(entries + [entry])
+            raise HTTPException(status_code=503, detail="reference delivery could not be started") from exc
+        entry["delivered"] = False
+        entry["delivery_status"] = "queued"
+        entry["queued_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        entry["consumed"] = True
+        _write_talk_entries(entries + [entry])
+    if process is not None:
+        threading.Thread(target=_record_delivery_completion, args=(entry["id"], process),
+                         name=f"artifact-stage-delivery-{entry['id'][:8]}", daemon=True).start()
     return entry
 
 

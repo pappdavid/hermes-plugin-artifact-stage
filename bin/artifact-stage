@@ -14,6 +14,7 @@ access drives the pane; nothing here talks to the dashboard API.
 """
 import argparse
 import fcntl
+from datetime import datetime
 import hashlib
 import json
 import mimetypes
@@ -200,6 +201,16 @@ def main() -> None:
             path = RUNTIME / name
             print(f"--- {name}")
             print(path.read_text(encoding="utf-8") if path.exists() else "(absent)")
+        ack = json.loads((RUNTIME / "ack.json").read_text(encoding="utf-8")) if (RUNTIME / "ack.json").exists() else {}
+        def age(value: str | None) -> str:
+            if not value:
+                return "unknown"
+            try:
+                stamp = datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+                return f"{max(0, int(time.time() - stamp))}s ago"
+            except (TypeError, ValueError):
+                return "unknown"
+        print(f"pane alive {age(ack.get('polled_at'))} · last render {age(ack.get('at'))}")
         staged = sorted(p.name for p in ARTIFACTS.iterdir()) if ARTIFACTS.exists() else []
         print(f"--- artifacts: {len(staged)} staged")
 

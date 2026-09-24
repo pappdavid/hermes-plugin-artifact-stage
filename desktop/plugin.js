@@ -40,7 +40,7 @@ function ToolButton({ label, onClick, children }) {
   })
 }
 
-function ArtifactBody({ artifact, seq, zoom, scrollRef, selectionMode, selectionRegion, onRegionSelected }) {
+function ArtifactBody({ artifact, seq, zoom, scrollRef, viewportRef, selectionMode, selectionRegion, onRegionSelected }) {
   const scaleStyle = {
     transform: `scale(${zoom})`,
     transformOrigin: 'top left',
@@ -108,8 +108,8 @@ function ArtifactBody({ artifact, seq, zoom, scrollRef, selectionMode, selection
   const dragStartRef = useRef(null)
   const [draftRegion, setDraftRegion] = useState(null)
   const pointFor = (event) => {
-    const bounds = event.currentTarget.getBoundingClientRect()
-    if (!bounds.width || !bounds.height) return null
+    const bounds = viewportRef.current && viewportRef.current.getBoundingClientRect()
+    if (!bounds || !bounds.width || !bounds.height) return null
     return {
       x: Math.max(0, Math.min(1, (event.clientX - bounds.left) / bounds.width)),
       y: Math.max(0, Math.min(1, (event.clientY - bounds.top) / bounds.height)),
@@ -159,21 +159,29 @@ function ArtifactBody({ artifact, seq, zoom, scrollRef, selectionMode, selection
     onMouseLeave: finishSelection,
   })
   const selectionOverlay = visibleRegion && jsx('div', {
-    className: 'pointer-events-none absolute z-20 border border-(--ui-accent)',
-    style: {
-      left: `${visibleRegion.x * 100}%`, top: `${visibleRegion.y * 100}%`,
-      width: `${visibleRegion.w * 100}%`, height: `${visibleRegion.h * 100}%`,
-      background: 'color-mix(in srgb, var(--ui-accent) 20%, transparent)',
-    },
+    className: 'pointer-events-none absolute inset-0 z-20',
+    children: jsx('div', {
+      className: 'absolute border border-(--ui-accent)',
+      style: {
+        left: `${visibleRegion.x * 100}%`, top: `${visibleRegion.y * 100}%`,
+        width: `${visibleRegion.w * 100}%`, height: `${visibleRegion.h * 100}%`,
+        background: 'color-mix(in srgb, var(--ui-accent) 20%, transparent)',
+      },
+    }),
   })
 
   return jsx('div', {
-    ref: scrollRef,
-    className: 'min-h-0 flex-1 overflow-auto',
-    children: jsxs('div', {
-      className: 'relative min-h-full w-full',
-      children: [content, selectionLayer, selectionOverlay],
-    }),
+    ref: viewportRef,
+    className: 'relative min-h-0 flex-1 overflow-hidden',
+    children: [
+      jsx('div', {
+        ref: scrollRef,
+        className: 'absolute inset-0 overflow-auto',
+        children: jsx('div', { className: 'relative min-h-full w-full', children: content }),
+      }),
+      selectionLayer,
+      selectionOverlay,
+    ],
   })
 }
 
@@ -186,6 +194,7 @@ function StagePane() {
   const appliedSeqRef = useRef(-1)
   const pendingScrollRef = useRef(null)
   const scrollRef = useRef(null)
+  const viewportRef = useRef(null)
   const [pendingCount, setPendingCount] = useState(0)
   const [talkPrompt, setTalkPrompt] = useState('')
   const [talkError, setTalkError] = useState(null)
@@ -216,6 +225,16 @@ function StagePane() {
         if (!live) return
         setConnErr(null)
         setState(s)
+        // A poll is a liveness heartbeat even when the staged state is unchanged.
+        try {
+          const ack = await api.rest('/ack', {
+            method: 'POST',
+            body: { seq: s.seq, heartbeat: true },
+          })
+          if (live) setLastAck(ack)
+        } catch (_) {
+          // Keep polling; the next heartbeat will retry.
+        }
       } catch (e) {
         if (live) setConnErr(String((e && e.message) || e))
       }
@@ -284,7 +303,10 @@ function StagePane() {
       await api.rest('/talk', {
         method: 'POST',
         body: {
-          prompt: safePrompt,
+          request_id: crypto.randomUUID(),
+          prompt: safePrompt.trim(),
+          profile: (host.state && host.state.focusedSessionProfile && host.state.focusedSessionProfile.get()) || 'default',
+          artifact_title: artifact ? artifact.title : 'current artifact',
           ...(selectionRegion ? { region: selectionRegion } : {}),
           ...(artifact ? { artifact_id: artifact.id } : {}),
         },
@@ -296,7 +318,7 @@ function StagePane() {
       setSendingTalk(false)
     }
   }
-  const supportsRegion = artifact && ['image', 'pdf'].includes(artifact.kind)
+  const supportsRegion = Boolean(artifact)
 
   const toolbar = jsxs('div', {
     className: 'flex items-center gap-1.5 border-b border-(--ui-stroke-secondary) px-2 py-1',
@@ -361,6 +383,7 @@ function StagePane() {
       seq: state.seq,
       zoom,
       scrollRef,
+      viewportRef,
       selectionMode: Boolean(supportsRegion && selectionMode),
       selectionRegion,
       onRegionSelected: (region) => {

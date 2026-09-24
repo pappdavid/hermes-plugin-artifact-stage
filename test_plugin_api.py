@@ -17,6 +17,7 @@ def client(tmp_path, monkeypatch):
     (tmp_path / "runtime" / "artifact-stage" / "artifacts").mkdir(parents=True)
     spec = importlib.util.spec_from_file_location("artifact_stage_plugin_api", PLUGIN_API)
     mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod
     spec.loader.exec_module(mod)
     from fastapi import FastAPI
 
@@ -42,8 +43,50 @@ def test_ack_roundtrip(client, tmp_path):
     assert r.status_code == 200 and r.json()["ok"] is True
     ack = client.get("/ack").json()
     assert ack["seq"] == 7 and ack["rendered"] is True
+    assert ack["at"] and ack["polled_at"]
     # ack.json exists on disk where the session CLI reads it
     assert (tmp_path / "runtime" / "artifact-stage" / "ack.json").exists()
+
+
+def test_ack_heartbeat_updates_liveness_without_overwriting_render(client):
+    rendered = client.post("/ack", json={"seq": 7, "rendered": True}).json()
+    before = client.get("/ack").json()
+    heartbeat = client.post("/ack", json={"seq": 8, "heartbeat": True}).json()
+    after = client.get("/ack").json()
+    assert heartbeat["ok"] and heartbeat["polled_at"] >= rendered["polled_at"]
+    assert after["seq"] == before["seq"] == 7
+    assert after["at"] == before["at"]
+    assert after["polled_at"] == heartbeat["polled_at"]
+
+
+def test_refer_delivery_receipt_records_region_and_is_not_left_pending(client, monkeypatch):
+    import artifact_stage_plugin_api as mod
+    delivered = []
+    monkeypatch.setattr(mod, "_spawn_reference_delivery", lambda entry: delivered.append(entry["id"]))
+    payload = {
+        "request_id": "test-request-1",
+        "prompt": "Review this heading",
+        "artifact_id": "html-report.html",
+        "artifact_title": "HTML master report",
+        "profile": "verifier",
+        "region": {"x": 0.1, "y": 0.2, "w": 0.3, "h": 0.4, "normalized": True},
+    }
+    response = client.post("/talk", json=payload)
+    assert response.status_code == 200
+    receipt = response.json()
+    duplicate = client.post("/talk", json=payload).json()
+    assert receipt["id"] and receipt["delivered"] is False and receipt["consumed"] is True
+    assert receipt["delivery_status"] == "queued" and receipt["queued_at"]
+    assert receipt["region"] == payload["region"]
+    assert duplicate["id"] == receipt["id"]
+    assert delivered == [receipt["id"]]
+    mod._record_delivery_completion(receipt["id"], type("Process", (), {"wait": lambda self: 0})())
+    completed = client.get(f"/talks/{receipt['id']}").json()
+    assert completed["delivered"] is True and completed["delivery_status"] == "delivered"
+    assert completed["completed_at"]
+    assert client.get("/talks").json()["pending"] == []
+    saved = (Path(os.environ["HERMES_HOME"]) / "runtime" / "artifact-stage" / "pending-turns.jsonl").read_text()
+    assert receipt["id"] in saved
 
 
 def test_file_serves_staged_bytes(client, tmp_path):
