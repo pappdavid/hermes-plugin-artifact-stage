@@ -7,7 +7,7 @@
  * polls the python backend (/api/plugins/artifact-stage/state), renders the
  * staged artifact, applies scroll/zoom commands, and POSTs /ack receipts.
  */
-import { cn } from '@hermes/plugin-sdk'
+import { cn, host } from '@hermes/plugin-sdk'
 import { jsx, jsxs } from 'react/jsx-runtime'
 import { useEffect, useRef, useState } from 'react'
 
@@ -419,5 +419,9 @@ export default {
       data: { placement: 'right', width: '480px' },
       render: () => jsx(StagePane, {}),
     })
+    // Plugin contributions are namespaced by createPluginContext as
+    // <pluginId>:<contributionId>. Reveal after registration so the pane is
+    // visible on load/reload instead of silently remaining only registered.
+    if (typeof host.revealPane === 'function') host.revealPane(`${ID}:artifact-stage-pane`)
   },
 }
