@@ -22,7 +22,9 @@ def client(tmp_path, monkeypatch):
 
     app = FastAPI()
     app.include_router(mod.router)
-    return TestClient(app)
+    client = TestClient(app)
+    client.app.state.plugin_module = mod
+    return client
 
 
 def test_state_absent_returns_none_cmd(client, tmp_path):
@@ -94,3 +96,29 @@ def test_session_cli_roundtrip(tmp_path, monkeypatch):
     assert os.system(f"{sys.executable} {cli} scroll 50") == 0
     state = json.loads((tmp_path / "runtime" / "artifact-stage" / "state.json").read_text())
     assert state["cmd"] == "scroll" and abs(state["view"]["scroll_pct"] - 0.5) < 1e-9
+
+
+def test_ack_heartbeat_preserves_render_receipt(client):
+    rendered = client.post("/ack", json={"seq": 19, "rendered": True, "error": None}).json()
+    heartbeat = client.post("/ack", json={"seq": 20, "heartbeat": True}).json()
+    ack = client.get("/ack").json()
+    assert rendered["ok"] and heartbeat["ok"]
+    assert ack["seq"] == 19
+    assert ack["rendered"] is True and ack["error"] is None
+    assert ack["polled_at"] > ack["at"]
+
+
+def test_refer_deduplicates_dispatch_and_records_receipt(client, monkeypatch):
+    dispatches = []
+    monkeypatch.setattr(client.app.state.plugin_module, "_spawn_reference_delivery",
+                        lambda entry: dispatches.append(entry["request_id"]))
+    payload = {"request_id": "ref-once", "prompt": "Review this artifact", "artifact_id": "demo.html"}
+    first = client.post("/talk", json=payload)
+    second = client.post("/talk", json=payload)
+    assert first.status_code == second.status_code == 200
+    assert first.json()["id"] == second.json()["id"]
+    assert dispatches == ["ref-once"]
+    entries = [__import__("json").loads(line) for line in
+               (Path(os.environ["HERMES_HOME"]) / "runtime/artifact-stage/pending-turns.jsonl").read_text().splitlines()]
+    assert len(entries) == 1 and entries[0]["request_id"] == "ref-once"
+    assert entries[0]["artifact_id"] == "demo.html"

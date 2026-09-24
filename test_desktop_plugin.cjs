@@ -48,10 +48,11 @@ test('loads remote artifact bytes through the authenticated plugin REST API', as
     useRef: (current) => ({ current }),
   }
   const loadPlugin = new Function(
-    'cn', 'jsx', 'jsxs', 'Fragment', 'useEffect', 'useRef', 'useState',
+    'cn', 'host', 'jsx', 'jsxs', 'Fragment', 'useEffect', 'useRef', 'useState',
     `${source}\nreturn plugin;`,
   )
-  const plugin = loadPlugin((...parts) => parts.filter(Boolean).join(' '), jsx, jsx, {},
+  const host = { revealPane: () => {}, composer: { submit: () => false } }
+  const plugin = loadPlugin((...parts) => parts.filter(Boolean).join(' '), host, jsx, jsx, {},
     hooks.useEffect, hooks.useRef, hooks.useState)
   const contributions = []
   plugin.register({
@@ -83,7 +84,9 @@ test('loads remote artifact bytes through the authenticated plugin REST API', as
   }
 
   renderPane()
-  effects.at(-1)()
+  const artifactLoadEffect = effects.find((effect) => effect.toString().includes('/file-data-url/'))
+  assert.ok(artifactLoadEffect, 'the remote-artifact loading effect is registered')
+  artifactLoadEffect()
   await new Promise((resolve) => setImmediate(resolve))
 
   const imageNode = findType(renderPane(), 'img')
@@ -94,4 +97,19 @@ test('loads remote artifact bytes through the authenticated plugin REST API', as
     new URL(imageNode.props.src, 'file:///Applications/Hermes.app/index.html').protocol,
     'data:',
   )
+})
+
+test('provides Refer for every artifact kind and token-checked composer bridge', () => {
+  const source = fs.readFileSync(path.join(__dirname, 'desktop/plugin.js'), 'utf8')
+  for (const kind of ['pdf', 'image', 'markdown', 'html']) {
+    assert.ok(source.includes(`'${kind}'`), `the pane handles ${kind}`)
+  }
+  assert.ok(source.includes("const referBar = artifact && REFER_KINDS.has(artifact.kind) && jsxs('form'"))
+  assert.ok(source.includes('request_id: crypto.randomUUID()'))
+  assert.ok(source.includes('body: { seq: s.seq, heartbeat: true }'))
+  assert.ok(source.includes('event.source !== frameRef.current.contentWindow'))
+  assert.ok(source.includes('message.token !== frameToken.current'))
+  assert.ok(source.includes("host.composer?.submit === 'function' && host.composer.submit(null, prompt)"))
+  assert.ok(source.includes('onFramePrompt(prompt)'))
+  assert.ok(source.includes('srcDoc: frameDoc'))
 })
