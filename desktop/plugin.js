@@ -16,10 +16,6 @@ const POLL_MS = 900
 
 let api = null // bound in register() before any render
 
-function fileUrl(artifact, seq) {
-  return `/api/plugins/artifact-stage/file/${encodeURIComponent(artifact.id)}?v=${seq}`
-}
-
 function Badge({ children }) {
   return jsx('span', {
     className: cn(
@@ -43,25 +39,30 @@ function ToolButton({ label, onClick, children }) {
   })
 }
 
-function ArtifactBody({ artifact, seq, zoom, scrollRef }) {
+function ArtifactBody({ artifact, zoom, scrollRef, src, loadError }) {
   const scaleStyle = {
     transform: `scale(${zoom})`,
     transformOrigin: 'top left',
     width: `${100 / zoom}%`,
   }
-  const url = fileUrl(artifact, seq)
+  const unavailable = loadError ? 'Could not load artifact: ' + loadError : 'Loading artifact…'
 
   let content
-  if (artifact.kind === 'pdf') {
-    content = jsx('embed', { src: url, type: 'application/pdf', className: 'w-full h-full min-h-[400px]' })
+  if (!src && ['pdf', 'image', 'html'].includes(artifact.kind)) {
+    content = jsx('div', {
+      className: 'p-3 text-xs text-(--ui-text-tertiary)',
+      children: unavailable,
+    })
+  } else if (artifact.kind === 'pdf') {
+    content = jsx('embed', { src, type: 'application/pdf', className: 'w-full h-full min-h-[400px]' })
   } else if (artifact.kind === 'image') {
     content = jsx('div', {
       style: scaleStyle,
-      children: jsx('img', { src: url, alt: artifact.title, className: 'max-w-full' }),
+      children: jsx('img', { src, alt: artifact.title, className: 'max-w-full' }),
     })
   } else if (artifact.kind === 'html') {
     content = jsx('iframe', {
-      src: url,
+      src,
       sandbox: 'allow-scripts',
       className: 'w-full h-full min-h-[400px] bg-white',
       title: artifact.title,
@@ -93,6 +94,8 @@ function StagePane() {
   const [artifact, setArtifact] = useState(null)
   const [zoom, setZoom] = useState(1)
   const [lastAck, setLastAck] = useState(null)
+  const [artifactUrl, setArtifactUrl] = useState(null)
+  const [artifactLoadError, setArtifactLoadError] = useState(null)
   const appliedSeqRef = useRef(-1)
   const pendingScrollRef = useRef(null)
   const scrollRef = useRef(null)
@@ -159,6 +162,31 @@ function StagePane() {
     })
   }, [artifact, zoom, state])
 
+  useEffect(() => {
+    if (!artifact || !['pdf', 'image', 'html'].includes(artifact.kind)) {
+      setArtifactUrl(null)
+      setArtifactLoadError(null)
+      return
+    }
+
+    let live = true
+    setArtifactUrl(null)
+    setArtifactLoadError(null)
+    void api.rest('/file-data-url/' + encodeURIComponent(artifact.id))
+      .then((result) => {
+        if (!live) return
+        if (!result || typeof result.data_url !== 'string' || !result.data_url.startsWith('data:')) {
+          throw new Error('Plugin API returned invalid artifact data')
+        }
+        setArtifactUrl(result.data_url)
+      })
+      .catch((e) => {
+        if (live) setArtifactLoadError(String((e && e.message) || e))
+      })
+
+    return () => { live = false }
+  }, [artifact && artifact.id, artifact && artifact.kind])
+
   const toolbar = jsxs('div', {
     className: 'flex items-center gap-1.5 border-b border-(--ui-stroke-secondary) px-2 py-1',
     children: [
@@ -203,7 +231,13 @@ function StagePane() {
       ],
     })
   } else {
-    body = jsx(ArtifactBody, { artifact, seq: state.seq, zoom, scrollRef })
+    body = jsx(ArtifactBody, {
+      artifact,
+      zoom,
+      scrollRef,
+      src: artifactUrl,
+      loadError: artifactLoadError,
+    })
   }
 
   const statusLine = state

@@ -13,6 +13,7 @@ state in, bytes out, acks back.
 
 from __future__ import annotations
 
+import base64
 import json
 import mimetypes
 import os
@@ -53,6 +54,16 @@ def _read_json(path: Path, default: dict) -> dict:
         return default
 
 
+def _artifact_path(artifact_id: str) -> Path:
+    if not _ARTIFACT_ID_RE.match(artifact_id) or ".." in artifact_id:
+        raise HTTPException(status_code=400, detail="bad artifact id")
+    artifacts_dir = _artifacts_dir().resolve()
+    path = (artifacts_dir / artifact_id).resolve()
+    if path.parent != artifacts_dir or not path.is_file():
+        raise HTTPException(status_code=404, detail="artifact not found")
+    return path
+
+
 @router.get("/state")
 def get_state() -> dict:
     return _read_json(_runtime_dir() / "state.json", {"cmd": "none", "seq": 0})
@@ -76,12 +87,16 @@ def post_ack(body: dict) -> dict:
     return {"ok": True, "seq": ack["seq"]}
 
 
+@router.get("/file-data-url/{artifact_id}")
+def get_file_data_url(artifact_id: str) -> dict:
+    path = _artifact_path(artifact_id)
+    media = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+    encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+    return {"mime_type": media, "data_url": f"data:{media};base64,{encoded}"}
+
+
 @router.get("/file/{artifact_id}")
 def get_file(artifact_id: str):
-    if not _ARTIFACT_ID_RE.match(artifact_id) or ".." in artifact_id:
-        raise HTTPException(status_code=400, detail="bad artifact id")
-    path = (_artifacts_dir() / artifact_id).resolve()
-    if path.parent != _artifacts_dir().resolve() or not path.is_file():
-        raise HTTPException(status_code=404, detail="artifact not found")
+    path = _artifact_path(artifact_id)
     media = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
     return FileResponse(path, media_type=media)

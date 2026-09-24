@@ -7,7 +7,8 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-PLUGIN_API = Path.home() / ".hermes" / "plugins" / "artifact-stage" / "dashboard" / "plugin_api.py"
+ROOT = Path(__file__).resolve().parent
+PLUGIN_API = ROOT / "dashboard" / "plugin_api.py"
 
 
 @pytest.fixture()
@@ -59,9 +60,25 @@ def test_file_rejects_traversal(client):
     assert client.get("/file/does-not-exist.pdf").status_code == 404
 
 
+def test_file_data_url_serves_staged_bytes_as_json(client, tmp_path):
+    art = tmp_path / "runtime" / "artifact-stage" / "artifacts" / "abc.png"
+    art.write_bytes(b"hello")
+    r = client.get("/file-data-url/abc.png")
+    assert r.status_code == 200
+    assert r.json() == {
+        "mime_type": "image/png",
+        "data_url": "data:image/png;base64,aGVsbG8=",
+    }
+
+
+def test_file_data_url_rejects_traversal(client):
+    assert client.get("/file-data-url/..%2F..%2Fconfig.yaml").status_code in (400, 404)
+    assert client.get("/file-data-url/does-not-exist.png").status_code == 404
+
+
 def test_session_cli_roundtrip(tmp_path, monkeypatch):
     """CLI stages a file + writes state.json the backend would serve."""
-    cli = Path.home() / ".hermes" / "bin" / "artifact-stage"
+    cli = ROOT / "bin" / "artifact-stage"
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     sample = tmp_path / "sample.md"
     sample.write_text("# hello stage", encoding="utf-8")

@@ -60,9 +60,9 @@ python -m pytest test_plugin_api.py
 node --test test_desktop_plugin.cjs
 ```
 
-Six in-process tests cover the API contract: state read, ack round-trip, artifact
-byte serving, path-traversal rejection, and the session CLI round-trip. The Node
-render test exercises the real desktop pane component with a staged image.
+Eight in-process tests cover state and ack round-trips, artifact byte and data-URL
+serving, path-traversal rejection, and the session CLI round-trip. The Node render
+test exercises authenticated asset loading in the desktop pane.
 
 ## Notes
 
