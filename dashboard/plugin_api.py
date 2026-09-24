@@ -14,10 +14,15 @@ state in, bytes out, acks back.
 from __future__ import annotations
 
 import base64
+import fcntl
 import json
+import math
 import mimetypes
 import os
 import re
+import uuid
+from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException
@@ -54,6 +59,82 @@ def _read_json(path: Path, default: dict) -> dict:
         return default
 
 
+@contextmanager
+def _talks_lock():
+    runtime = _runtime_dir()
+    runtime.mkdir(parents=True, exist_ok=True)
+    with (runtime / ".pending-turns.lock").open("a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def _talks_path() -> Path:
+    return _runtime_dir() / "pending-turns.jsonl"
+
+
+def _read_talk_entries() -> list[dict]:
+    path = _talks_path()
+    if not path.exists():
+        return []
+    entries = []
+    for line_no, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            entry = json.loads(line)
+        except ValueError as exc:
+            raise HTTPException(status_code=500, detail=f"corrupt pending turns at line {line_no}") from exc
+        if not isinstance(entry, dict):
+            raise HTTPException(status_code=500, detail=f"invalid pending turn at line {line_no}")
+        entries.append(entry)
+    return entries
+
+
+def _write_talk_entries(entries: list[dict]) -> None:
+    path = _talks_path()
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    payload = "".join(json.dumps(entry, ensure_ascii=False) + "\n" for entry in entries)
+    with tmp.open("w", encoding="utf-8") as stream:
+        stream.write(payload)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(tmp, path)
+
+
+def _validate_talk(body: dict) -> dict:
+    prompt = body.get("prompt")
+    if not isinstance(prompt, str) or not 1 <= len(prompt) <= 2000:
+        raise HTTPException(status_code=422, detail="prompt must contain 1..2000 characters")
+    entry = {
+        "id": uuid.uuid4().hex,
+        "ts_iso": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "prompt": prompt,
+        "region": None,
+        "artifact_id": None,
+        "consumed": False,
+    }
+    if "artifact_id" in body and body["artifact_id"] is not None:
+        artifact_id = body["artifact_id"]
+        if not isinstance(artifact_id, str) or not _ARTIFACT_ID_RE.fullmatch(artifact_id) or ".." in artifact_id:
+            raise HTTPException(status_code=422, detail="invalid artifact_id")
+        entry["artifact_id"] = artifact_id
+    if "region" in body and body["region"] is not None:
+        region = body["region"]
+        if not isinstance(region, dict) or region.get("normalized") is not True:
+            raise HTTPException(status_code=422, detail="region must use normalized coordinates")
+        values = [region.get(key) for key in ("x", "y", "w", "h")]
+        if any(isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) for value in values):
+            raise HTTPException(status_code=422, detail="region coordinates must be finite numbers")
+        x, y, w, h = (float(value) for value in values)
+        if x < 0 or y < 0 or w <= 0 or h <= 0 or x + w > 1 or y + h > 1:
+            raise HTTPException(status_code=422, detail="region must fit within normalized 0..1 bounds")
+        entry["region"] = {"x": x, "y": y, "w": w, "h": h, "normalized": True}
+    return entry
+
+
 def _artifact_path(artifact_id: str) -> Path:
     if not _ARTIFACT_ID_RE.match(artifact_id) or ".." in artifact_id:
         raise HTTPException(status_code=400, detail="bad artifact id")
@@ -85,6 +166,40 @@ def post_ack(body: dict) -> dict:
     }
     _atomic_write_json(_runtime_dir() / "ack.json", ack)
     return {"ok": True, "seq": ack["seq"]}
+
+
+@router.get("/talks")
+def get_talks() -> dict:
+    with _talks_lock():
+        pending = [entry for entry in _read_talk_entries() if not entry.get("consumed", False)]
+    return {"pending": pending}
+
+
+@router.post("/talk")
+def post_talk(body: dict) -> dict:
+    entry = _validate_talk(body)
+    with _talks_lock():
+        path = _talks_path()
+        with path.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+    return entry
+
+
+@router.post("/talks/pop")
+def pop_talk(body: dict) -> dict:
+    talk_id = body.get("id")
+    if not isinstance(talk_id, str) or not talk_id:
+        raise HTTPException(status_code=422, detail="id is required")
+    with _talks_lock():
+        entries = _read_talk_entries()
+        for entry in entries:
+            if entry.get("id") == talk_id and not entry.get("consumed", False):
+                entry["consumed"] = True
+                _write_talk_entries(entries)
+                return entry
+    raise HTTPException(status_code=404, detail="pending talk not found")
 
 
 @router.get("/file-data-url/{artifact_id}")

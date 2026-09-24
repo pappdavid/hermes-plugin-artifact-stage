@@ -9,8 +9,11 @@ access drives the pane; nothing here talks to the dashboard API.
   artifact-stage zoom <1.0>           set zoom factor
   artifact-stage clear                empty the stage
   artifact-stage status               state + pane receipt
+  artifact-stage talk-list             print pending pane references as JSONL
+  artifact-stage talk-pop              consume + print the oldest pending reference
 """
 import argparse
+import fcntl
 import hashlib
 import json
 import mimetypes
@@ -24,6 +27,46 @@ RUNTIME = HOME / "runtime" / "artifact-stage"
 ARTIFACTS = RUNTIME / "artifacts"
 TEXT_KINDS = {"text", "markdown"}
 MAX_TEXT_CHARS = 300_000
+
+
+def _talks_path() -> Path:
+    return RUNTIME / "pending-turns.jsonl"
+
+
+def _read_turns() -> list[dict]:
+    path = _talks_path()
+    if not path.exists():
+        return []
+    turns = []
+    for line_no, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            turn = json.loads(line)
+        except ValueError as exc:
+            raise SystemExit(f"invalid pending turn JSON at line {line_no}") from exc
+        if isinstance(turn, dict):
+            turns.append(turn)
+    return turns
+
+
+def _write_turns(turns: list[dict]) -> None:
+    path = _talks_path()
+    RUNTIME.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8") as stream:
+        for turn in turns:
+            stream.write(json.dumps(turn, ensure_ascii=False) + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(tmp, path)
+
+
+def _with_turn_lock():
+    RUNTIME.mkdir(parents=True, exist_ok=True)
+    lock = (RUNTIME / ".pending-turns.lock").open("a+")
+    fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+    return lock
 
 
 def kind_for(path: Path, force: str | None) -> str:
@@ -106,10 +149,36 @@ def main() -> None:
 
     sub.add_parser("clear")
     sub.add_parser("status")
+    sub.add_parser("talk-list")
+    sub.add_parser("talk-pop")
 
     args = ap.parse_args()
 
-    if args.cmd == "open":
+    if args.cmd == "talk-list":
+        lock = _with_turn_lock()
+        try:
+            for turn in _read_turns():
+                if not turn.get("consumed", False):
+                    print(json.dumps(turn, ensure_ascii=False))
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+            lock.close()
+    elif args.cmd == "talk-pop":
+        lock = _with_turn_lock()
+        try:
+            turns = _read_turns()
+            popped = None
+            for turn in turns:
+                if not turn.get("consumed", False):
+                    turn["consumed"] = True
+                    popped = turn
+                    _write_turns(turns)
+                    break
+            print(json.dumps(popped, ensure_ascii=False))
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+            lock.close()
+    elif args.cmd == "open":
         state = stage(Path(args.file).expanduser(), args.title, args.kind)
         print(f"staged {state['artifact']['id']} ({state['artifact']['kind']}, "
               f"{state['artifact']['bytes']}B) seq={state['seq']}")
