@@ -1,0 +1,139 @@
+#!/usr/bin/env python3
+"""Artifact Stage — session-side driver.
+
+Writes the control state the desktop pane renders. Any session with file
+access drives the pane; nothing here talks to the dashboard API.
+
+  artifact-stage open <file> [--title T] [--kind pdf|image|text|markdown|html]
+  artifact-stage scroll <0-100>       scroll the pane to a percentage
+  artifact-stage zoom <1.0>           set zoom factor
+  artifact-stage clear                empty the stage
+  artifact-stage status               state + pane receipt
+"""
+import argparse
+import hashlib
+import json
+import mimetypes
+import os
+import sys
+import time
+from pathlib import Path
+
+HOME = Path(os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes"))
+RUNTIME = HOME / "runtime" / "artifact-stage"
+ARTIFACTS = RUNTIME / "artifacts"
+TEXT_KINDS = {"text", "markdown"}
+MAX_TEXT_CHARS = 300_000
+
+
+def kind_for(path: Path, force: str | None) -> str:
+    if force:
+        return force
+    suffix = path.suffix.lower()
+    if suffix == ".pdf":
+        return "pdf"
+    if suffix in {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp"}:
+        return "image"
+    if suffix in {".html", ".htm"}:
+        return "html"
+    if suffix in {".md", ".markdown"}:
+        return "markdown"
+    return "text"
+
+
+def media_for(artifact_name: str, kind: str) -> str:
+    if kind == "text":
+        return "text/plain; charset=utf-8"
+    if kind == "markdown":
+        return "text/markdown; charset=utf-8"
+    return mimetypes.guess_type(artifact_name)[0] or "application/octet-stream"
+
+
+def write_state(payload: dict) -> dict:
+    RUNTIME.mkdir(parents=True, exist_ok=True)
+    ARTIFACTS.mkdir(parents=True, exist_ok=True)
+    payload["seq"] = int(time.time() * 1000)
+    payload["issued_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    tmp = RUNTIME / "state.json.tmp"
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8")
+    os.replace(tmp, RUNTIME / "state.json")
+    return payload
+
+
+def stage(path: Path, title: str | None, kind: str | None) -> dict:
+    if not path.is_file():
+        raise SystemExit(f"no such file: {path}")
+    kind = kind_for(path, kind)
+    raw = path.read_bytes()
+    ARTIFACTS.mkdir(parents=True, exist_ok=True)
+    artifact_id = hashlib.sha1(raw).hexdigest()[:12]
+    artifact_name = artifact_id + path.suffix.lower()
+    (ARTIFACTS / artifact_name).write_bytes(raw)
+    artifact = {
+        "id": artifact_name,
+        "kind": kind,
+        "title": title or path.name,
+        "bytes": len(raw),
+        "media_type": media_for(artifact_name, kind),
+    }
+    if kind in TEXT_KINDS:
+        text = raw.decode("utf-8", errors="replace")
+        if len(text) > MAX_TEXT_CHARS:
+            text = text[:MAX_TEXT_CHARS] + "\n\n… [truncated]"
+        artifact["text"] = text
+    return write_state({
+        "cmd": "open",
+        "artifact": artifact,
+        "view": {"scroll_pct": 0.0, "zoom": 1.0},
+        "issued_by": os.environ.get("HERMES_SESSION_ID") or "session",
+    })
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(prog="artifact-stage")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p_open = sub.add_parser("open")
+    p_open.add_argument("file")
+    p_open.add_argument("--title")
+    p_open.add_argument("--kind", choices=["pdf", "image", "text", "markdown", "html"])
+
+    p_scroll = sub.add_parser("scroll")
+    p_scroll.add_argument("pct", type=float)
+
+    p_zoom = sub.add_parser("zoom")
+    p_zoom.add_argument("factor", type=float)
+
+    sub.add_parser("clear")
+    sub.add_parser("status")
+
+    args = ap.parse_args()
+
+    if args.cmd == "open":
+        state = stage(Path(args.file).expanduser(), args.title, args.kind)
+        print(f"staged {state['artifact']['id']} ({state['artifact']['kind']}, "
+              f"{state['artifact']['bytes']}B) seq={state['seq']}")
+    elif args.cmd == "scroll":
+        pct = max(0.0, min(100.0, args.pct)) / 100.0
+        state = write_state({"cmd": "scroll", "view": {"scroll_pct": pct},
+                             "issued_by": os.environ.get("HERMES_SESSION_ID") or "session"})
+        print(f"scroll {pct:.0%} seq={state['seq']}")
+    elif args.cmd == "zoom":
+        factor = max(0.25, min(4.0, args.factor))
+        state = write_state({"cmd": "zoom", "view": {"zoom": factor},
+                             "issued_by": os.environ.get("HERMES_SESSION_ID") or "session"})
+        print(f"zoom {factor} seq={state['seq']}")
+    elif args.cmd == "clear":
+        state = write_state({"cmd": "clear", "issued_by": os.environ.get("HERMES_SESSION_ID") or "session"})
+        print(f"cleared seq={state['seq']}")
+    elif args.cmd == "status":
+        for name in ("state.json", "ack.json"):
+            path = RUNTIME / name
+            print(f"--- {name}")
+            print(path.read_text(encoding="utf-8") if path.exists() else "(absent)")
+        staged = sorted(p.name for p in ARTIFACTS.iterdir()) if ARTIFACTS.exists() else []
+        print(f"--- artifacts: {len(staged)} staged")
+
+
+if __name__ == "__main__":
+    main()

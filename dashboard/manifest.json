@@ -1,0 +1,9 @@
+{
+  "name": "artifact-stage",
+  "label": "Artifact Stage",
+  "description": "Session-driven shared artifact pane (PDF/image/text/html) with display-state receipts.",
+  "icon": "Project",
+  "version": "0.1.0",
+  "api": "plugin_api.py",
+  "has_api": true
+}
